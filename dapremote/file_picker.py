@@ -1,7 +1,8 @@
 """Explorer-style HEX/FLM chooser for a fixed device directory and PC drives."""
 import os
 from pathlib import Path, PurePosixPath
-from tkinter import ttk, messagebox
+from tkinter import ttk
+from .ui_dialogs import messagebox, center_window, workarea
 import tkinter as tk
 
 from .firmware import ARTIFACT_DIRS, ARTIFACT_EXTENSIONS, artifact_path, ensure_artifact_directory, import_artifact, UploadConflict
@@ -55,12 +56,13 @@ class ArtifactPicker:
         self.history = []
         self.window = tk.Toplevel(app.root)
         self.window.title("选择 %s %s" % (kind.upper(), "固件" if kind == "hex" else "烧录算法"))
-        width = max(540, min(900, self.window.winfo_screenwidth() - 80))
-        height = max(320, min(580, self.window.winfo_screenheight() - 140))
-        self.window.geometry("%dx%d" % (width, height))
+        bounds = workarea(app.root)
+        width = min(940, bounds[2] - bounds[0] - 48)
+        height = min(620, bounds[3] - bounds[1] - 80)
+        center_window(self.window, app.root, width, height)
         self.window.minsize(min(720, width), min(420, height))
         self.window.transient(app.root)
-        outer = ttk.Frame(self.window, padding=12)
+        outer = ttk.Frame(self.window, padding=18)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(2, weight=1)
@@ -107,7 +109,7 @@ class ArtifactPicker:
         footer.columnconfigure(0, weight=1)
         self.filename = tk.StringVar(value="请选择文件")
         ttk.Label(footer, textvariable=self.filename, width=1, anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.choose_button = ttk.Button(footer, text="选择文件", command=self.choose)
+        self.choose_button = ttk.Button(footer, text="选择文件", command=self.choose, style="Primary.TButton")
         self.choose_button.grid(row=0, column=2)
         ttk.Button(footer, text="取消", command=self.window.destroy).grid(row=0, column=1, padx=(0, 8))
         self.navigate("sd", ARTIFACT_DIRS[kind], remember=False)

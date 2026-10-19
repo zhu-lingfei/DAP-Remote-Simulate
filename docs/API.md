@@ -277,3 +277,14 @@ GUI 算法列表接口：`App.refresh_flm_files(auto=False)` 从 SD `/FLM` 根�
 算法文件类型定义于 `firmware.ARTIFACT_EXTENSIONS`：hex 对应 `.hex`，flm 仅对应 `.flm`，扩展名大小写不敏感。`artifact_kind(path)` 对 FLX 返回 None；`artifact_path`、算法导入辅助接口和客户端拒绝 FLX，模拟器收到 FLX 算法请求返回 UNSUPPORTED。算法协议仍使用 flm_path、flm_version。
 
 `App.upload()` 不调用文件库归档辅助接口，不检查文件扩展名。目标固定为当前目录加原始文件名，通过 `upload_regular_file` 执行；所有类型共用重名询问、完整性校验和续传流程。烧录页 HEX 弹窗保留 `import_artifact` 本地导入行为。`.FLM` 后缀仅是必要过滤条件，真实固件仍需验证目标指令集、RAM/Flash 布局和算法入口；Python 模拟器不执行上传的算法。
+
+
+### GUI 样式与弹窗定位辅助接口
+
+- `ui_theme.configure_theme(root)` 应用统一扁平 ttk 样式，返回 Style。
+- `ui_dialogs.workarea(owner)` 返回所属屏幕可用范围 `(left,top,right,bottom)`。
+- `centered_rect(bounds,width,height)` 返回限制到屏幕内的 `(width,height,x,y)`，支持负坐标。
+- `center_window(window,owner=None,width=None,height=None)` 设置 Tk 窗口初始尺寸和居中位置。
+- `filedialog`、`messagebox`、`simpledialog` 代理保留原 tkinter 调用形式；应传入 parent。在 Windows 上临时安装当前线程的 CBT 回调处理所属弹窗，结束时清理。其他平台使用 tkinter 自身的窗口归属和定位方式。
+
+以上仅影响界面外观和窗口位置，不改变协议、文件目录策略或烧录流程。

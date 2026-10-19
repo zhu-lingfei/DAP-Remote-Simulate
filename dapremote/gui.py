@@ -5,7 +5,9 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import ttk
+from .ui_dialogs import filedialog, messagebox, simpledialog, center_window, workarea
+from .ui_theme import configure_theme, CANVAS, LINE
 
 from .client import Client
 from .gui_flash import FlashCoordinator
@@ -41,9 +43,10 @@ class App:
         self.bench_cancel = threading.Event()
         self.buttons = []
         root.title("DAP Remote · 远程调试工作台")
-        root.geometry("1180x830")
-        root.minsize(1000, 700)
-        root.configure(background="#F3F6FB")
+        bounds = workarea(root)
+        width, height = min(1220, bounds[2] - bounds[0] - 48), min(860, bounds[3] - bounds[1] - 64)
+        root.minsize(min(1000, width), min(700, height))
+        center_window(root, width=width, height=height)
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.report_callback_exception = self._callback_error
         self.endpoint = tk.StringVar(value=endpoint)
@@ -55,39 +58,53 @@ class App:
         self.destination = tk.StringVar(value="电脑 + SD 卡")
         self.rtt_path = tk.StringVar(value="/rtt.log")
         header = ttk.Frame(root, padding=(20, 16), style="Card.TFrame")
-        header.pack(fill="x")
-        ttk.Label(header, text="DAP Remote", style="Brand.TLabel").pack(side="left")
-        ttk.Entry(header, textvariable=self.endpoint, width=35).pack(side="left", padx=14)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(3, weight=1)
+        header.grid(row=0, column=0, sticky="ew")
+        brand = ttk.Frame(header, style="Card.TFrame")
+        brand.pack(side="left", padx=(0, 28))
+        ttk.Label(brand, text="DAP Remote", style="Brand.TLabel").pack(anchor="w")
+        ttk.Label(brand, text="REMOTE DEBUG WORKSPACE", style="Eyebrow.TLabel").pack(anchor="w", pady=(1, 0))
+        ttk.Label(header, text="连接地址", style="Card.TLabel").pack(side="left")
+        ttk.Entry(header, textvariable=self.endpoint, width=31).pack(side="left", padx=(8, 16))
         ttk.Label(header, text="波特率", style="Card.TLabel").pack(side="left")
         ttk.Entry(header, textvariable=self.port_baud, width=9).pack(side="left", padx=5)
         self.button(header, "连接设备", self.connect, style="Primary.TButton").pack(side="left")
         self.button(header, "断开", self.disconnect).pack(side="left", padx=5)
-        status_bar = ttk.Frame(root, padding=(20, 10))
-        status_bar.pack(fill="x")
-        self.connection_badge = ttk.Label(status_bar, text="● 未连接", style="Muted.TLabel")
+        ttk.Separator(root).grid(row=1, column=0, sticky="ew")
+        status_bar = ttk.Frame(root, padding=(20, 9))
+        status_bar.grid(row=2, column=0, sticky="ew")
+        self.connection_badge = ttk.Label(status_bar, text="● 未连接", style="Badge.TLabel")
         self.connection_badge.pack(side="left", padx=(0, 14))
         ttk.Label(status_bar, textvariable=self.device_summary, style="Muted.TLabel").pack(side="left")
         self.button(status_bar, "刷新设备状态", self.device_status).pack(side="right")
         notebook = ttk.Notebook(root)
         self.notebook = notebook
-        notebook.pack(fill="both", expand=True, padx=20)
+        notebook.grid(row=3, column=0, sticky="nsew", padx=20)
         files, rtt, jobs, bench = [ttk.Frame(notebook, padding=16) for _ in range(4)]
         self.jobs_page = jobs
         for frame, title in ((files, "文件管理"), (rtt, "RTT 终端"), (jobs, "烧录任务"), (bench, "串口测速")):
             notebook.add(frame, text=title)
+        file_heading = ttk.Frame(files)
+        files.columnconfigure(0, weight=1)
+        files.rowconfigure(2, weight=1)
+        file_heading.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        ttk.Label(file_heading, text="SD 卡文件", style="Section.TLabel").pack(side="left")
+        ttk.Label(file_heading, text="双击文件夹进入 · 文件上传到当前目录", style="Muted.TLabel").pack(side="left", padx=16)
         bar = ttk.Frame(files)
-        bar.pack(fill="x")
+        bar.grid(row=1, column=0, sticky="ew")
         ttk.Entry(bar, textvariable=self.directory, width=35).pack(side="left")
         for label, action in (("上一级", self.parent_directory), ("刷新", self.refresh), ("上传文件", self.upload),
                               ("取回文件", self.download), ("新建目录", self.mkdir),
                               ("删除所选", self.delete)):
             self.button(bar, label, action).pack(side="left", padx=3)
         table_frame = ttk.Frame(files)
-        table_frame.pack(fill="both", expand=True, pady=10)
+        table_frame.grid(row=2, column=0, sticky="nsew", pady=10)
         self.files = ttk.Treeview(table_frame, columns=("path", "size", "version"), show="headings")
-        for name, title, width in (("path", "设备路径", 450), ("size", "大小 / 类型", 140), ("version", "文件校验摘要", 220)):
+        for name, title, width in (("path", "名称", 450), ("size", "大小 / 类型", 140), ("version", "文件校验摘要", 220)):
             self.files.heading(name, text=title)
             self.files.column(name, width=width)
+        self.files.tag_configure("alternate", background="#F8FAFD")
         self.files.pack(side="left", fill="both", expand=True)
         file_scroll = ttk.Scrollbar(table_frame, command=self.files.yview)
         file_scroll.pack(side="right", fill="y")
@@ -95,7 +112,7 @@ class App:
         self.files.bind("<Double-1>", self.open_directory)
         self.entries = {}
         self.file_summary = tk.StringVar(value="双击文件夹进入；选择文件后使用上方按钮操作。")
-        ttk.Label(files, textvariable=self.file_summary, style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(files, textvariable=self.file_summary, style="Muted.TLabel").grid(row=3, column=0, sticky="w")
         bar = ttk.Frame(rtt)
         bar.pack(fill="x")
         ttk.Combobox(bar, state="readonly", textvariable=self.destination,
@@ -116,7 +133,7 @@ class App:
         self._build_flash_page(jobs)
         self._build_benchmark(bench)
         log_header = ttk.Frame(root, padding=(20, 10, 20, 4))
-        log_header.pack(fill="x")
+        log_header.grid(row=4, column=0, sticky="ew")
         ttk.Label(log_header, text="操作日志", style="Section.TLabel").pack(side="left")
         ttk.Label(log_header, textvariable=self.log_count_text, style="Muted.TLabel").pack(side="left", padx=12)
         self.copy_button = ttk.Button(log_header, text="复制", command=self.copy_log)
@@ -126,8 +143,8 @@ class App:
         ttk.Checkbutton(log_header, text="错误弹窗", variable=self.error_dialogs).pack(side="right", padx=10)
         ttk.Checkbutton(log_header, text="自动滚动", variable=self.auto_scroll).pack(side="right")
         log_frame = ttk.Frame(root)
-        log_frame.pack(fill="x", padx=20)
-        self.log = tk.Text(log_frame, height=6, wrap="word", font=("Consolas", 10),
+        log_frame.grid(row=5, column=0, sticky="ew", padx=20)
+        self.log = tk.Text(log_frame, height=5, wrap="word", font=("Consolas", 10),
                            background="#FFFFFF", foreground="#334155", relief="flat", padx=12, pady=10, state="disabled")
         self.log.pack(side="left", fill="x", expand=True)
         scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
@@ -137,7 +154,7 @@ class App:
             for level, color in (("INFO", "#475569"), ("SUCCESS", "#15803D"), ("WARN", "#A16207"), ("ERROR", "#B91C1C")):
                 widget.tag_configure(level, foreground=color)
         footer = ttk.Frame(root, padding=(20, 7, 20, 10))
-        footer.pack(fill="x")
+        footer.grid(row=6, column=0, sticky="ew")
         ttk.Label(footer, textvariable=self.status, style="Muted.TLabel").pack(side="left")
         self.activity_bar = ttk.Progressbar(footer, length=120, mode="indeterminate", style="Accent.Horizontal.TProgressbar")
         self.activity_bar.pack(side="right")
@@ -146,36 +163,14 @@ class App:
             self.log_message(self.flash_operations.load_error, "ERROR")
         self._update_flash_button()
         notebook.bind("<<NotebookTabChanged>>", lambda _: self._maybe_auto_preview())
+        for text in (self.log, self.job_text, self.hex_text, self.rtt_text):
+            text.configure(borderwidth=0, highlightthickness=1, highlightbackground=LINE,
+                           highlightcolor="#A9BFFF", insertbackground="#334155")
         self.root.after(50, self.drain)
         self.root.after(250, self.poll)
 
     def _configure_style(self):
-        self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        style.configure("TFrame", background="#F3F6FB")
-        style.configure("Card.TFrame", background="#FFFFFF")
-        style.configure("TLabel", background="#F3F6FB", foreground="#172338")
-        style.configure("Card.TLabel", background="#FFFFFF")
-        style.configure("Muted.TLabel", foreground="#64748B", font=("Microsoft YaHei UI", 9))
-        style.configure("Brand.TLabel", background="#FFFFFF", foreground="#1E3A5F", font=("Segoe UI", 20, "bold"))
-        style.configure("Section.TLabel", font=("Microsoft YaHei UI", 11, "bold"))
-        style.configure("TButton", padding=(10, 7), background="#E8EEF7", foreground="#243B58", borderwidth=0)
-        style.map("TButton", background=[("active", "#D9E5F4"), ("disabled", "#EDF1F6")], foreground=[("disabled", "#94A3B8")])
-        style.configure("Primary.TButton", background="#2563EB", foreground="#FFFFFF")
-        style.map("Primary.TButton", background=[("active", "#1D4ED8"), ("disabled", "#CBD5E1")], foreground=[("disabled", "#FFFFFF")])
-        style.configure("Danger.TButton", background="#FEECEC", foreground="#B91C1C")
-        style.map("Danger.TButton", background=[("active", "#FCDDDD"), ("disabled", "#EDF1F6")])
-        style.configure("TEntry", padding=6, bordercolor="#D5DFED", fieldbackground="#FFFFFF")
-        style.configure("TCombobox", padding=5, fieldbackground="#FFFFFF", bordercolor="#D5DFED")
-        style.configure("TNotebook", background="#F3F6FB", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(24, 11), background="#E9EFF8", foreground="#64748B")
-        style.map("TNotebook.Tab", background=[("selected", "#FFFFFF")], foreground=[("selected", "#1D4ED8")])
-        style.configure("Treeview", rowheight=34, background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#243B58", borderwidth=0)
-        style.configure("Treeview.Heading", padding=(10, 8), background="#E9EFF8", foreground="#52657E", relief="flat")
-        style.map("Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", "#1E40AF")])
-        style.configure("TCheckbutton", background="#F3F6FB", foreground="#64748B")
-        style.configure("Accent.Horizontal.TProgressbar", background="#2563EB", troughcolor="#E2EAF6", borderwidth=0)
+        self.style = configure_theme(self.root)
 
     def _build_flash_page(self, page):
         self.flash_panes = ttk.Panedwindow(page, orient="horizontal")
@@ -349,6 +344,9 @@ class App:
             self.selected_flm = selected
             self.flm_filename.set(info["name"])
             self.flm_choice.set(info["name"])
+        if self.selected_hex and self.selected_flm and self._last_job is None:
+            self.job_phase.set("准备就绪")
+            self.job_progress_text.set("固件与算法已选定，点击开始烧录")
         self.log_message("已选用 %s · %s" % (kind.upper(), info["name"]), "SUCCESS")
         self._update_flash_button()
         if kind == "hex":
@@ -621,7 +619,7 @@ class App:
         endpoint = self.connected_endpoint
         self.connection_generation += 1
         self.poll_suspended = False
-        self.connection_badge.configure(text="● 已连接", foreground="#15803D")
+        self.connection_badge.configure(text="● 已连接", style="Connected.Badge.TLabel")
         self.status.set("设备连接成功")
         self.log_message("连接成功 · " + client.info["device_id"], "SUCCESS")
         def attached(result):
@@ -661,7 +659,7 @@ class App:
         self.flm_filename.set("尚未选择 FLM 算法")
         self.flm_list_hint.set("连接设备后加载 /FLM 目录中的 仅 FLM")
         self.connection_generation += 1
-        self.connection_badge.configure(text="● 未连接", foreground="#64748B")
+        self.connection_badge.configure(text="● 未连接", style="Badge.TLabel")
         self.device_summary.set("设备未连接")
         self.log_message("连接已断开。设备上的任务与 SD 日志可能继续，重连后可查询。", "WARN")
         self.status.set("已断开；设备侧任务和 SD 日志可能继续，重连后自动恢复任务状态")
@@ -681,8 +679,8 @@ class App:
     def listed(self, entries):
         self.files.delete(*self.files.get_children())
         self.entries = {entry["path"]: entry for entry in entries}
-        for entry in entries:
-            self.files.insert("", "end", iid=entry["path"], values=(entry["path"],
+        for index, entry in enumerate(entries):
+            self.files.insert("", "end", iid=entry["path"], tags=("alternate",) if index % 2 else (), values=(entry["name"],
                               "文件夹" if entry["is_dir"] else size_text(entry["size"]),
                               entry["version"][:12] + "…" if entry["version"] else "—"))
         self.file_summary.set("目录 %s · %d 项；双击文件夹进入，文件使用上方按钮操作。" % (self.directory.get(), len(entries)))
@@ -758,7 +756,7 @@ class App:
         entry = self.selected()
         if not self.require_client() or not entry or entry["is_dir"]:
             return
-        local = filedialog.asksaveasfilename(initialfile=entry["name"])
+        local = filedialog.asksaveasfilename(parent=self.root, title="取回文件", initialfile=entry["name"])
         if local:
             client, progress = self.client, self._transfer_callback("取回文件")
             def done(result):
@@ -767,7 +765,7 @@ class App:
 
     def mkdir(self):
         if self.require_client():
-            path = simpledialog.askstring("新建目录", "设备完整路径：")
+            path = simpledialog.askstring("新建目录", "设备完整路径：", parent=self.root)
             if path:
                 client = self.client
                 def done(_):
@@ -777,7 +775,7 @@ class App:
 
     def delete(self):
         entry = self.selected()
-        if self.require_client() and entry and messagebox.askyesno("删除", "删除 %s？" % entry["path"]):
+        if self.require_client() and entry and messagebox.askyesno("删除", "删除 %s？" % entry["path"], parent=self.root, default="no"):
             client = self.client
             def done(_):
                 self.log_message("已删除 · " + entry["path"], "SUCCESS")

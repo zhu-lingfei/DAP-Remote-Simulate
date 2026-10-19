@@ -183,6 +183,13 @@ def main():
                 app.choose_firmware()
             picker = app.artifact_picker
             wait_until(lambda: not app.busy and not picker.loading)
+            from dapremote.ui_dialogs import workarea, centered_rect
+            initial_bounds = workarea(root)
+            initial_geometry = centered_rect(initial_bounds, min(940, initial_bounds[2] - initial_bounds[0] - 48),
+                                               min(620, initial_bounds[3] - initial_bounds[1] - 80))
+            root.update()
+            assert abs(picker.window.winfo_x() - initial_geometry[2]) <= 32
+            assert abs(picker.window.winfo_y() - initial_geometry[3]) <= 40
             # Exercise actual window geometry invisibly; the footer must stay inside at minimum size.
             wait_until(lambda: picker.window.winfo_ismapped(), timeout=3)
             scaling = float(root.tk.call("tk", "scaling"))
@@ -332,12 +339,52 @@ def main():
                 assert app.client.read_preview("/my-files/" + source.name)["data"] == source.read_bytes()
                 assert app.directory.get() == "/my-files", "upload must not switch directories"
             assert {entry["name"] for entry in app.client.list_files("/my-files")} == {local_hex.name, algorithm.name, upload_source.name}
+            # Exercise a real native confirmation. Close only this test-owned dialog automatically.
+            import os
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes as w
+                from tkinter import messagebox as native_messages
+                from dapremote.ui_dialogs import native_dialog_centering
+                title = "DAP Remote placement check %d" % os.getpid()
+                user = ctypes.WinDLL("user32", use_last_error=True)
+                user.FindWindowW.argtypes, user.FindWindowW.restype = [w.LPCWSTR, w.LPCWSTR], w.HWND
+                user.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+                user.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+                user.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
+                checked, stop = [], threading.Event()
+                def positioned(hwnd, area):
+                    rect = w.RECT()
+                    user.GetWindowRect(hwnd, ctypes.byref(rect))
+                    checked.append((rect.left, rect.top, rect.right, rect.bottom, area))
+                    user.PostMessageW(hwnd, 0x0111, 7, 0)  # WM_COMMAND / IDNO
+                def watchdog():
+                    if stop.wait(3):
+                        return
+                    hwnd = user.FindWindowW("#32770", title)
+                    process = w.DWORD()
+                    if hwnd:
+                        user.GetWindowThreadProcessId(hwnd, ctypes.byref(process))
+                        if process.value == os.getpid():
+                            user.PostMessageW(hwnd, 0x0111, 7, 0)
+                guard = threading.Thread(target=watchdog, daemon=True)
+                guard.start()
+                try:
+                    with native_dialog_centering(root, positioned):
+                        answer = native_messages.askyesno(title, "Automatic dialog placement check", parent=root, default="no")
+                    assert answer is False and checked, "native confirmation was not centered"
+                    left, top, right, bottom, area = checked[0]
+                    target = centered_rect(area, right - left, bottom - top)
+                    assert abs(left - target[2]) <= 2 and abs(top - target[3]) <= 2
+                finally:
+                    stop.set()
+                    guard.join(1)
             visible_log = app.log.get("1.0", "end-1c") + app.job_text.get("1.0", "end-1c")
             assert all(token not in visible_log for token in tokens), "internal ID leaked to visible logs"
             app.clear_log()
             assert not app.log.get("1.0", "end-1c")
             assert app.log_count == 0
-            print("GUI smoke passed: FLM-only algorithms, uploads follow double-clicked directory for every file type, conflict dialogs, HEX picker, flashing, recovery, RTT")
+            print("GUI smoke passed: flat theme, centered HEX picker/native confirmation, minimum-size/high-DPI footer, current-directory uploads, FLM-only, flashing, recovery, RTT")
         finally:
             app.close()
 
