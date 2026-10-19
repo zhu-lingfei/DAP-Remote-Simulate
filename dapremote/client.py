@@ -1,5 +1,6 @@
 """Synchronous API. Calls are serialized; use a worker thread in GUI programs."""
 import hashlib
+import contextlib
 import json
 import os
 import secrets
@@ -151,6 +152,49 @@ class Client:
             raise ValueError("block must contain 1..512 bytes")
         return self._rpc(Op.FILE_DATA, FILE_HEADER.pack(transfer_id, offset, len(data)) + data)
 
+    def read_preview(self, remote_path, max_bytes=16384):
+        """Read a bounded prefix, releasing the transfer before returning.
+
+        Complete files are checked against SHA-256. Partial previews are explicitly
+        marked unverified; ordinary frame CRC and device version checks still apply.
+        No local file or download sidecar is created.
+        """
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 256 * 1024:
+            raise ValueError("preview size must be 1..262144 bytes")
+        with self.lock:
+            info = self.stat(remote_path)
+            if info["is_dir"]:
+                raise ValueError("不能预览文件夹，请选择 HEX 文件。")
+            transfer_id, finalized = None, False
+            try:
+                transfer = self.call(Op.FILE_BEGIN, direction="download", path=remote_path, version=info["version"])
+                transfer_id = transfer["transfer_id"]
+                if transfer["size"] != info["size"] or transfer["sha256"].hex() != info["version"]:
+                    raise ProtocolError("preview transfer metadata mismatch")
+                limit, data = min(info["size"], max_bytes), bytearray()
+                while len(data) < limit:
+                    offset, length = len(data), min(512, limit - len(data))
+                    block = self.call(Op.FILE_READ, transfer_id=transfer_id, offset=offset, length=length)
+                    payload = block["data"]
+                    if (block["offset"] != offset or not 1 <= len(payload) <= length or
+                            block["next_offset"] != offset + len(payload)):
+                        raise ProtocolError("invalid preview block")
+                    data.extend(payload)
+                complete = len(data) == info["size"]
+                if complete:
+                    if hashlib.sha256(data).hexdigest() != info["version"]:
+                        raise ProtocolError("HEX 预览文件完整性校验失败。")
+                    self.call(Op.FILE_END, transfer_id=transfer_id)
+                else:
+                    self.call(Op.FILE_ABORT, transfer_id=transfer_id)
+                finalized = True
+                return dict(path=remote_path, size=info["size"], version=info["version"],
+                            data=bytes(data), truncated=not complete, verified=complete)
+            finally:
+                if transfer_id is not None and not finalized:
+                    with contextlib.suppress(Exception):
+                        self.call(Op.FILE_ABORT, transfer_id=transfer_id)
+
     def upload(self, local_path, remote_path, overwrite=False, resume_file=None, progress=None):
         """Upload and commit; optional sidecar allows resume with a new Client."""
         local = Path(local_path)
@@ -276,11 +320,27 @@ class Client:
         sidecar.unlink(missing_ok=True)
         return dict(path=str(local), size=offset, version=digest.hexdigest())
 
-    def check_hex(self, remote_path, version=None):
-        version = version or self.stat(remote_path)["version"]
-        return self.call(Op.FLASH_CHECK, path=remote_path, version=version)
+    def _flm_fields(self, flm_path=None, flm_version=None):
+        if flm_path is None and flm_version is None:
+            return {}
+        if not flm_path:
+            raise ValueError("请选择 FLM 烧录算法。")
+        if Path(flm_path).suffix.lower() != ".flm":
+            raise ValueError("烧录算法仅支持 .FLM 文件，不支持 FLX。")
+        # Unknown optional TLVs may be ignored by older peers, so negotiate first.
+        features = self.call(Op.GET_CAPS).get("features", "").split(";")[0].split(",")
+        if "flm-select-v1" not in features:
+            raise ValueError("设备未声明 FLM 选择能力，请更新设备协议实现。")
+        flm_version = flm_version or self.stat(flm_path)["version"]
+        return dict(flm_path=flm_path, flm_version=flm_version)
 
-    def start_flash(self, remote_path, operation_token, version=None, run_after=False, target_id=None):
+    def check_hex(self, remote_path, version=None, flm_path=None, flm_version=None):
+        version = version or self.stat(remote_path)["version"]
+        return self.call(Op.FLASH_CHECK, path=remote_path, version=version,
+                         **self._flm_fields(flm_path, flm_version))
+
+    def start_flash(self, remote_path, operation_token, version=None, run_after=False, target_id=None,
+                    flm_path=None, flm_version=None):
         """Caller must retain token BEFORE sending; reuse it unchanged on reconnect."""
         if not operation_token:
             raise ValueError("operation_token is required")
@@ -288,7 +348,7 @@ class Client:
         target_id = target_id or self.call(Op.TARGET_INFO)["target_id"]
         return self.call(Op.FLASH_START, path=remote_path, version=version,
                          operation_token=operation_token, run_after=run_after,
-                         target_id=target_id)
+                         target_id=target_id, **self._flm_fields(flm_path, flm_version))
 
     def job_status(self, job_id=None, operation_token=None):
         if not job_id and not operation_token:

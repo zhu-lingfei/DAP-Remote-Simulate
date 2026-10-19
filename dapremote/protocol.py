@@ -230,6 +230,7 @@ _FIELDS = [
     ("bench_id", "u64"), ("sink", "str"), ("received_bytes", "u64"),
     ("elapsed_us", "u64"), ("verify_us", "u64"), ("passed", "bool"),
     ("sequence_errors", "u64"), ("framing_errors", "u64"),
+    ("flm_path", "str"), ("flm_version", "str"),
 ]
 SCHEMA = {name: (i + 1, kind) for i, (name, kind) in enumerate(_FIELDS)}
 BY_TAG = {tag: (name, kind) for name, (tag, kind) in SCHEMA.items()}

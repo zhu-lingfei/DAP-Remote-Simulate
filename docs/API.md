@@ -57,6 +57,20 @@ dap.delete("/firmware/old.hex", info["version"])
 
 ## 3. 上传和断线续传
 
+### 有界文件预览
+
+```python
+preview = dap.read_preview("/firmware/app.hex", max_bytes=16384)
+print(preview["data"].decode("ascii", errors="backslashreplace"))
+print(preview["truncated"], preview["verified"])
+```
+
+`read_preview(remote_path, max_bytes=16384)` 返回 `path,size,version,data,truncated,verified`。`size` 是整个文件大小，`data` 是最多 max_bytes 的原始前缀；max_bytes 必须为 1..262144。完整读取时核对 SHA-256 并 FILE_END，部分读取时 FILE_ABORT 释放事务；异常时也尝试清理。该操作不创建本地文件或续传侧车。`verified=False` 表示没有读取整个文件，不能当作整文件校验通过；帧 CRC 与设备源版本检查仍正常工作。
+
+此方法复用已有文件指令，无新增线上 opcode。目录、源文件变化、读写错误或其他活动文件传输可能导致异常；GUI 将错误显示为可读提示。
+
+### 上传
+
 ```python
 result = dap.upload(
     "build/app.hex", "/firmware/app.hex",
@@ -115,8 +129,8 @@ if result["state"] != "DONE":
 
 | 方法 | 说明 |
 |---|---|
-| `check_hex(remote_path,version=None)` | 不提供版本时先 stat；检查 HEX 记录、重叠、EOF、地址范围；返回 `total_bytes,min_address,max_address,target_id`，max 为包含边界 |
-| `start_flash(remote_path,operation_token,version=None,run_after=False,target_id=None)` | token 必填；默认查询 TARGET_INFO；返回任务状态字典 |
+| `check_hex(remote_path,version=None,flm_path=None,flm_version=None)` | 不提供版本时先 stat；检查 HEX 记录、重叠、EOF、地址范围；返回 `total_bytes,min_address,max_address,target_id`，max 为包含边界 |
+| `start_flash(remote_path,operation_token,version=None,run_after=False,target_id=None,flm_path=None,flm_version=None)` | token 必填；默认查询 TARGET_INFO；返回任务状态字典 |
 | `job_status(job_id=None,operation_token=None)` | 至少提供一项；两项同时提供时 job_id 优先 |
 | `wait_job(job_id,timeout=30,progress=None)` | 每 100 ms 查询，返回终态字典；任务失败也作为状态返回，调用者必须检查 `state` |
 
@@ -175,8 +189,8 @@ SD 输出使用新建文件、不覆盖；达到 `sd_max_bytes` 或写入错误�
 | FILE_END | transfer_id | COMMITTED 状态及传输字段 |
 | FILE_ABORT | transfer_id | 空字典；已提交文件不能回滚 |
 | TARGET_INFO | 无 | target_id,base_address,flash_size |
-| FLASH_CHECK | path,version,target_id? | HEX 检查结果 |
-| FLASH_START | path,version,operation_token,run_after?=False,target_id? | ACCEPTED + job_id 等任务字段 |
+| FLASH_CHECK | path,version,target_id?,flm_path?,flm_version? | HEX 检查结果 |
+| FLASH_START | path,version,operation_token,run_after?=False,target_id?,flm_path?,flm_version? | ACCEPTED + job_id 等任务字段 |
 | JOB_STATUS | job_id 或 operation_token | job_id,operation_token,state,phase,completed_bytes,total_bytes,error,run_after |
 | JOB_LIST | cursor?=0,limit?=8 | jobs,next_cursor；不要在列表变化时依赖索引稳定 |
 | JOB_CANCEL | job_id 或 operation_token | 任务状态；终态任务不改变 |
@@ -212,3 +226,54 @@ FILE_READ 读取请求本身就是流控；下一请求表示主机已经处理�
 本版取消在模拟器锁保护的阶段边界立即生效；不模拟真实 Flash 控制器不可中断区间。目标可能已有部分擦写，取消后不自动运行。
 
 活动文件事务、SD RTT 日志、烧录文件受业务锁保护。烧录与 RTT 互斥；文件传输和 RTT 可以同时运行。一个设备只允许一个活动文件事务；活动事务闲置 600 秒过期。每次 boot 最多保留 256 条传输记录，达到上限需重启模拟器。生产固件需要设计可查询的保留期限和清理策略。
+
+
+## 9. HEX / FLM 文件库和算法选择
+
+烧录页从 `/HEX` 选用 HEX、从 `/FLM` 下拉框选用 FLM。文件管理上传始终使用当前目录，不按类型归档；Python 文件 API 同样支持通用路径。
+
+| Python 接口 | 行为与返回 |
+|---|---|
+| `firmware.ARTIFACT_DIRS` | `{"hex": "/HEX", "flm": "/FLM"}`；目录约定集中定义 |
+| `artifact_path(path, kind)` | 验证类型、扩展名、文件库边界；拒绝路径穿越。返回 SD 路径；不访问设备 |
+| `ensure_artifact_directory(client, kind)` | 按需创建对应文件库；同名文件占位时报错 |
+| `import_artifact(client, local_path, kind, cache_dir, progress=None, collision="rename", overwrite_version=None)` | 保存副本、可靠上传/复用并核对文件版本，返回 `path,name,version,size`。kind 为 hex/flm。不做 HEX 目标检查，不执行 FLM，不启动烧录 |
+| `prepare_local_firmware(client, local_path, cache_dir, progress=None)` | 兼容旧辅助接口：导入 `/HEX` 后执行 HEX 检查，增加 `check` 字段；GUI 不再用它延迟上传 |
+| `file_picker.ArtifactPicker(app, kind, on_selected)` | HEX 弹窗统一浏览 SD/电脑，PC 选中后立即调用 import_artifact；成功才回调 on_selected(info)。失败保留旧选择。FLM GUI 使用下拉框，不调用此弹窗 |
+| `FlashCoordinator.start(client, endpoint, path, expected_version=None, flm_path=None, flm_version=None)` | 新任务绑定 HEX 与可选 FLM 版本并持久化；未决任务只查询。返回 `{job,recovered}` |
+
+`progress(current,total)` 复用现有上传回调。缓存副本及续传记录在 cache_dir，不污染原文件目录；已上传内容不自动清理。同名不同内容使用 SHA-256 后缀，不覆盖原文件。上传完成不代表芯片适配检查通过。
+
+### 线协议扩展：flm-select-v1
+
+GET_CAPS 的 features 增加逗号分隔能力 `flm-select-v1`。客户端只有确认此能力才发送 FLM 参数，避免旧设备忽略可选 TLV 后使用默认算法。已有操作码和 TLV 编号保持不变，尾部追加 `flm_path:str`、`flm_version:str`，编号见 REFERENCE.md。两个字段必须成对出现，flm_version 为对应 SD 文件的 SHA-256 十六进制字符串。
+
+FLASH_CHECK 和 FLASH_START 接受上述字段。Client 在提供路径但省略版本时先 stat 补全；提供版本时严格使用该版本。版本变化返回 FILE_CHANGED；文件不存在返回 NOT_FOUND；算法格式不支持返回 INVALID_ARGUMENT。FLM 参数参与 FLASH_START 的业务指纹，相同 operation_token 换算法会返回 REQUEST_CONFLICT。任务执行期间设备锁定两个文件。设备最终必须再次检查版本，不能只依赖电脑预检查。
+
+```python
+from dapremote.firmware import import_artifact
+firmware = import_artifact(dap, "app.hex", "hex", ".dapremote/firmware-cache")
+algorithm = import_artifact(dap, "chip.flm", "flm", ".dapremote/firmware-cache")
+checked = dap.check_hex(firmware["path"], version=firmware["version"],
+                        flm_path=algorithm["path"], flm_version=algorithm["version"])
+# GUI 使用 FlashCoordinator 在 FLASH_START 之前持久化操作编号和两个版本。
+job = coordinator.start(dap, endpoint, firmware["path"], expected_version=firmware["version"],
+                        flm_path=algorithm["path"], flm_version=algorithm["version"])
+```
+
+保留不带 FLM 的旧 API 调用以兼容既有脚本和模拟目标；新版 GUI 必须显式选择 FLM。当前模拟器仅检查 ELF32 little-endian ARM 基本文件头、尺寸和版本，不执行 FLM 算法、不从 FLM 获取目标几何。真实固件需解析算法符号和 FlashDevice、配置目标 RAM、检查芯片兼容性并调用初始化/擦除/编程/校验函数。依据 [CMSIS-Pack Flash Programming](https://open-cmsis-pack.github.io/Open-CMSIS-Pack-Spec/main/html/flashAlgorithm.html)。
+
+
+GUI 算法列表接口：`App.refresh_flm_files(auto=False)` 从 SD `/FLM` 根目录读取 `.flm` 文件；自动调用每次连接读取一次，手动调用强制刷新。`App.select_flm()` 将下拉框中已知条目（含路径与 SHA-256）设为当前算法。列表为空/加载失败/断开时禁用选择，刷新发现原条目删除或版本变化时撤销选择；不自动替用户选择另一算法。上传 FLM 可使用文件管理或 `import_artifact`，上传后刷新下拉框。协议参数保持不变。
+
+
+### 上传冲突处理
+
+`UploadConflict(path, version)` 表示目标存在不同内容，携带被询问文件的路径和 SHA-256。`upload_regular_file(client, local_path, remote_path, progress=None, overwrite_version=None)` 在已确定的目录上传普通文件；不存在时直接上传，同名同内容复用，不同内容且尚未确认时抛出 UploadConflict。GUI 在主线程询问是否覆盖，确认后带原 version 重试；如果文件已变化，会重新报冲突，不沿用过时确认。
+
+`import_artifact` 增加 `collision` 和 `overwrite_version`：默认 `rename` 保留脚本兼容行为；GUI 显式使用 `ask`，同名不同内容抛 UploadConflict，得到确认后按原文件名覆盖，不自动产生另一份改名副本。目标为目录时拒绝覆盖。GUI 不再弹出目标路径输入框；文件管理上传的所有类型（包括 HEX/FLM）都使用当前目录；仅烧录页 HEX 弹窗的本地导入使用固定 `/HEX` 文件库。
+
+
+算法文件类型定义于 `firmware.ARTIFACT_EXTENSIONS`：hex 对应 `.hex`，flm 仅对应 `.flm`，扩展名大小写不敏感。`artifact_kind(path)` 对 FLX 返回 None；`artifact_path`、算法导入辅助接口和客户端拒绝 FLX，模拟器收到 FLX 算法请求返回 UNSUPPORTED。算法协议仍使用 flm_path、flm_version。
+
+`App.upload()` 不调用文件库归档辅助接口，不检查文件扩展名。目标固定为当前目录加原始文件名，通过 `upload_regular_file` 执行；所有类型共用重名询问、完整性校验和续传流程。烧录页 HEX 弹窗保留 `import_artifact` 本地导入行为。`.FLM` 后缀仅是必要过滤条件，真实固件仍需验证目标指令集、RAM/Flash 布局和算法入口；Python 模拟器不执行上传的算法。

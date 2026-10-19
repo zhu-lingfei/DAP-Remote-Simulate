@@ -155,3 +155,5 @@
 | `passed` | 77 | `bool` |
 | `sequence_errors` | 78 | `u64` |
 | `framing_errors` | 79 | `u64` |
+| `flm_path` | 80 | `str` |
+| `flm_version` | 81 | `str` |

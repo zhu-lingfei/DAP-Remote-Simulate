@@ -120,7 +120,7 @@ class Device:
             if transfer["state"] == "ACTIVE" and transfer["path"] == str(path):
                 return True
         for job in self.jobs.values():
-            if job["state"] not in TERMINAL and job["path"] == str(path):
+            if job["state"] not in TERMINAL and str(path) in (job["path"], job.get("flm_path")):
                 return True
         return any(stream["active"] and stream["destinations"] & 2 and
                    stream["sd_path_abs"] == str(path) for stream in self.streams.values())
@@ -196,7 +196,7 @@ class Device:
             return Status.OK, dict(boot_id=self.boot_id)
         if op == Op.GET_CAPS:
             return Status.OK, dict(protocol=1, max_payload=4096, block_size=512,
-                                   features="files,hex,jobs,rtt-pull,rtt-sd,power,sim-config,bench-raw-v1;no-auth;no-power-resume")
+                                   features="files,hex,jobs,rtt-pull,rtt-sd,power,sim-config,bench-raw-v1,flm-select-v1;no-auth;no-power-resume")
         if op == Op.DEV_INFO:
             return Status.OK, dict(device_id="DAP-SIM-001", boot_id=self.boot_id,
                                    protocol=1, target_id="SIM-CORTEX-M")
@@ -441,6 +441,24 @@ class Device:
                     if job["fingerprint"] != fingerprint:
                         raise DeviceError(Status.REQUEST_CONFLICT, "operation token reused with different parameters")
                     return Status.ACCEPTED, self._job_info(job)
+        flm = None
+        if "flm_path" in f or "flm_version" in f:
+            if not f.get("flm_path") or not f.get("flm_version"):
+                raise DeviceError(Status.INVALID_ARGUMENT, "FLM path and version are required together")
+            flm = self._path(f["flm_path"])
+            self._version(flm, f["flm_version"])
+            self._assert_unlocked(flm)
+            if flm.suffix.lower() != ".flm":
+                raise DeviceError(Status.UNSUPPORTED, "烧录算法仅支持 .FLM 文件，不支持 FLX")
+            if not 52 <= flm.stat().st_size <= 4 * 1024 * 1024:
+                raise DeviceError(Status.INVALID_ARGUMENT, "FLM 文件大小必须为 52 字节至 4 MiB")
+            with flm.open("rb") as source:
+                header = source.read(52)
+            # Envelope check only. The simulator never executes an uploaded FLM.
+            if (header[:7] != b"\x7fELF\x01\x01\x01" or struct.unpack_from("<H", header, 18)[0] != 40
+                    or struct.unpack_from("<H", header, 16)[0] not in (1, 2)
+                    or struct.unpack_from("<H", header, 40)[0] != 52):
+                raise DeviceError(Status.INVALID_ARGUMENT, "FLM is not a supported ELF32 little-endian ARM envelope")
         path = self._path(f["path"])
         self._version(path, f["version"])
         self._assert_unlocked(path)
@@ -465,6 +483,8 @@ class Device:
                    path=str(path), state="QUEUED", phase="QUEUED", completed_bytes=0,
                    total_bytes=len(image), error="", run_after=f.get("run_after", False),
                    image=sorted(image.items()), tick=time.monotonic())
+        if flm is not None:
+            job.update(flm_path=str(flm), flm_version=f["flm_version"])
         self.jobs[job_id] = job
         try:
             self._save_jobs()

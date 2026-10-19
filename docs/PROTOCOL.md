@@ -166,3 +166,10 @@ timestamp_ms 是 DAP 采集服务时间。日志没有整文件 footer；读取�
 - request 缓存及最高已处理编号需要按 session 管理；operation_token 是另一层去重。
 - 每个字段 tag、状态码、op 编号对应 REFERENCE.md；不使用编译器裸结构体布局发送帧，逐字段编码以避免对齐和字节序问题。
 - 复用 tests/vectors.json 检验 C 实现，之后加入 SD、SWD 与实际蓝牙压力测试。
+
+
+## FLM 显式选择扩展
+
+GET_CAPS 声明 `flm-select-v1` 后，FLASH_CHECK / FLASH_START 可带 `flm_path`、`flm_version`（必须成对，版本为 SHA-256）。字段追加到既有 TLV 表末尾；旧编号和帧格式不变。客户端必须先确认能力，不能假设旧设备会识别可选字段。FLM 参数参与操作编号指纹与持久化任务，执行期间 HEX 和 FLM 均锁定。新版 GUI 必须选择 FLM，旧脚本省略字段时保持旧行为。
+
+烧录页文件库约定：HEX 位于 `/HEX`，算法仅允许 `/FLM` 中的 FLM 文件；HEX 弹窗选中本地文件即导入。文件管理上传始终使用用户当前浏览目录，不按 HEX/FLM 分流。选用与启动烧录分离。文件通用 API 保留任意合法 SD 路径能力。当前模拟器只做 FLM ELF 文件头与版本校验，使用内置模拟目标擦写；真实 FLM 加载、目标适配和算法执行由嵌入式端实现。

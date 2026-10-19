@@ -9,6 +9,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .client import Client
 from .gui_flash import FlashCoordinator
+from .firmware import ARTIFACT_DIRS, ARTIFACT_EXTENSIONS, artifact_path, ensure_artifact_directory, UploadConflict, upload_regular_file
+from .file_picker import ArtifactPicker
+from .hex_preview import MAX_PREVIEW_LINES, preview_lines
 from .gui_text import (Notice, PHASES, RttTextDecoder, detail_text, error_notice,
                        job_notice, result_notice, scan_notice, size_text)
 from .protocol import Op
@@ -66,8 +69,10 @@ class App:
         ttk.Label(status_bar, textvariable=self.device_summary, style="Muted.TLabel").pack(side="left")
         self.button(status_bar, "刷新设备状态", self.device_status).pack(side="right")
         notebook = ttk.Notebook(root)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True, padx=20)
         files, rtt, jobs, bench = [ttk.Frame(notebook, padding=16) for _ in range(4)]
+        self.jobs_page = jobs
         for frame, title in ((files, "文件管理"), (rtt, "RTT 终端"), (jobs, "烧录任务"), (bench, "串口测速")):
             notebook.add(frame, text=title)
         bar = ttk.Frame(files)
@@ -89,7 +94,7 @@ class App:
         self.files.configure(yscrollcommand=file_scroll.set)
         self.files.bind("<Double-1>", self.open_directory)
         self.entries = {}
-        self.file_summary = tk.StringVar(value="选择文件可取回、删除；双击文件夹进入目录。")
+        self.file_summary = tk.StringVar(value="双击文件夹进入；选择文件后使用上方按钮操作。")
         ttk.Label(files, textvariable=self.file_summary, style="Muted.TLabel").pack(anchor="w")
         bar = ttk.Frame(rtt)
         bar.pack(fill="x")
@@ -108,30 +113,7 @@ class App:
         self.rtt_input = ttk.Entry(bar, width=60)
         self.rtt_input.pack(side="left", fill="x", expand=True)
         self.button(bar, "发送 UTF-8 输入", self.write_rtt).pack(side="left", padx=6)
-        bar = ttk.Frame(jobs)
-        bar.pack(fill="x")
-        self.flash_path = ttk.Entry(bar, width=35)
-        self.flash_path.insert(0, "/blink.hex")
-        self.flash_path.pack(side="left")
-        for label, action in (("检查 HEX", self.check_hex), ("开始烧录", self.flash),
-                              ("取消任务", self.cancel_job), ("设备状态", self.device_status)):
-            button = self.button(bar, label, action)
-            button.pack(side="left", padx=4)
-            if action == self.flash:
-                self.flash_button = button
-        row = ttk.Frame(jobs)
-        row.pack(fill="x", pady=10)
-        ttk.Label(row, text="烧录完成后可再次点击开始新的烧录；断线后可刷新任务状态。", style="Muted.TLabel").pack(side="left")
-        self.button(row, "刷新任务状态", self.refresh_flash).pack(side="right", padx=5)
-        self.job_phase = tk.StringVar(value="等待选择固件")
-        self.job_progress_text = tk.StringVar(value="开始烧录后，在这里查看阶段与进度")
-        ttk.Label(jobs, textvariable=self.job_phase, style="Section.TLabel").pack(anchor="w", pady=(4, 6))
-        self.job_bar = ttk.Progressbar(jobs, maximum=100, style="Accent.Horizontal.TProgressbar")
-        self.job_bar.pack(fill="x", pady=(0, 5))
-        ttk.Label(jobs, textvariable=self.job_progress_text, style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
-        self.job_text = tk.Text(jobs, height=5, wrap="word", font=("Microsoft YaHei UI", 10),
-                               relief="flat", background="#FFFFFF", padx=12, pady=10, state="disabled")
-        self.job_text.pack(fill="both", expand=True)
+        self._build_flash_page(jobs)
         self._build_benchmark(bench)
         log_header = ttk.Frame(root, padding=(20, 10, 20, 4))
         log_header.pack(fill="x")
@@ -163,6 +145,7 @@ class App:
         if self.flash_operations.load_error:
             self.log_message(self.flash_operations.load_error, "ERROR")
         self._update_flash_button()
+        notebook.bind("<<NotebookTabChanged>>", lambda _: self._maybe_auto_preview())
         self.root.after(50, self.drain)
         self.root.after(250, self.poll)
 
@@ -193,6 +176,298 @@ class App:
         style.map("Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", "#1E40AF")])
         style.configure("TCheckbutton", background="#F3F6FB", foreground="#64748B")
         style.configure("Accent.Horizontal.TProgressbar", background="#2563EB", troughcolor="#E2EAF6", borderwidth=0)
+
+    def _build_flash_page(self, page):
+        self.flash_panes = ttk.Panedwindow(page, orient="horizontal")
+        self.flash_panes.pack(fill="both", expand=True)
+        left, right = ttk.Frame(self.flash_panes, padding=(0, 0, 12)), ttk.Frame(self.flash_panes, padding=(12, 0, 0))
+        self.flash_panes.add(left, weight=1)
+        self.flash_panes.add(right, weight=1)
+        self.hex_preview_info = tk.StringVar(value="选择 HEX 固件后加载预览")
+        self._preview_limit = 16 * 1024
+        self._preview_request = 0
+        self._preview_attempt = self._preview_loaded_path = None
+        self._preview_truncated = False
+        ttk.Label(left, text="HEX 文件预览", style="Section.TLabel").pack(anchor="w")
+        toolbar = ttk.Frame(left)
+        toolbar.pack(fill="x", pady=(8, 6))
+        self.preview_refresh_button = self.button(toolbar, "刷新预览", self.load_hex_preview)
+        self.preview_refresh_button.pack(side="left")
+        self.preview_more_button = self.button(toolbar, "加载更多", self.load_more_preview)
+        self.preview_more_button.pack(side="left", padx=6)
+        ttk.Label(left, textvariable=self.hex_preview_info, wraplength=420, style="Muted.TLabel").pack(anchor="w", pady=(0, 7))
+        text_frame = ttk.Frame(left)
+        text_frame.pack(fill="both", expand=True)
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+        self.hex_text = tk.Text(text_frame, wrap="none", width=1, height=6, state="disabled", relief="flat",
+                                background="#FFFFFF", foreground="#243B58", font=("Consolas", 10), padx=10, pady=10)
+        self.hex_text.grid(row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(text_frame, orient="vertical", command=self.hex_text.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(text_frame, orient="horizontal", command=self.hex_text.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.hex_text.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        for tag, color in (("number", "#94A3B8"), ("data", "#243B58"), ("address", "#2563EB"),
+                            ("start", "#7C3AED"), ("eof", "#15803D"), ("error", "#B91C1C"),
+                            ("partial", "#A16207"), ("blank", "#64748B")):
+            self.hex_text.tag_configure(tag, foreground=color)
+        ttk.Label(left, text="蓝色：地址记录  ·  绿色：结束记录  ·  红色：格式或校验异常", style="Muted.TLabel", wraplength=420).pack(anchor="w", pady=(7, 0))
+
+        ttk.Label(right, text="烧录控制", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        self.selected_hex = self.selected_flm = None
+        self.artifact_picker = None
+        self.flash_path_var = tk.StringVar()
+        self.hex_filename = tk.StringVar(value="尚未选择 HEX 固件")
+        self.flm_filename = tk.StringVar(value="尚未选择 FLM 算法")
+        row = ttk.Frame(right)
+        row.pack(fill="x", pady=(0, 8))
+        self.button(row, "选择 HEX…", self.choose_firmware).pack(side="right", padx=(8, 0))
+        ttk.Label(row, textvariable=self.hex_filename, wraplength=240).pack(side="left", fill="x", expand=True)
+        ttk.Label(right, text="烧录算法 · SD 文件库（仅 FLM）", style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+        row = ttk.Frame(right)
+        row.pack(fill="x", pady=(0, 4))
+        self.flm_choice = tk.StringVar()
+        self.flm_files = {}
+        self._flm_list_generation = None
+        self.flm_combo = ttk.Combobox(row, textvariable=self.flm_choice, state="disabled", width=1)
+        self.flm_combo.pack(side="left", fill="x", expand=True)
+        self.flm_combo.bind("<<ComboboxSelected>>", self.select_flm)
+        self.button(row, "刷新 FLM", self.refresh_flm_files).pack(side="right", padx=(8, 0))
+        self.flm_list_hint = tk.StringVar(value="连接设备后加载 /FLM 目录中的 仅 FLM")
+        ttk.Label(right, textvariable=self.flm_list_hint, style="Muted.TLabel", wraplength=390).pack(anchor="w", pady=(0, 8))
+        actions = ttk.Frame(right)
+        actions.pack(fill="x")
+        actions.columnconfigure(0, weight=1, uniform="flash-actions")
+        actions.columnconfigure(1, weight=1, uniform="flash-actions")
+        for index, (label, action) in enumerate((("检查 HEX", self.check_hex), ("开始烧录", self.flash),
+                                                ("取消任务", self.cancel_job), ("设备状态", self.device_status))):
+            button = self.button(actions, label, action)
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 6, 0), pady=(0, 6))
+            if action == self.flash:
+                self.flash_button = button
+        self.button(right, "刷新任务状态", self.refresh_flash).pack(anchor="w", pady=(0, 8))
+        self.job_phase = tk.StringVar(value="等待选择固件")
+        self.job_progress_text = tk.StringVar(value="烧录完成后可再次点击开始新任务")
+        ttk.Label(right, textvariable=self.job_phase, style="Section.TLabel").pack(anchor="w", pady=(4, 6))
+        self.job_bar = ttk.Progressbar(right, maximum=100, style="Accent.Horizontal.TProgressbar")
+        self.job_bar.pack(fill="x", pady=(0, 5))
+        ttk.Label(right, textvariable=self.job_progress_text, wraplength=370, style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+        self.job_text = tk.Text(right, width=1, height=4, wrap="word", font=("Microsoft YaHei UI", 10),
+                               relief="flat", background="#FFFFFF", padx=12, pady=10, state="disabled")
+        self.job_text.pack(fill="both", expand=True)
+        self.flash_path_var.trace_add("write", self._preview_path_changed)
+        self._preview_placeholder("尚未加载 HEX 文件。\n\n点击右侧“选择 HEX 固件…”，从 SD 文件库或电脑中选择。")
+
+    def _firmware_path(self):
+        return self.flash_path_var.get()
+
+    def choose_firmware(self):
+        self.choose_artifact("hex")
+
+    def choose_artifact(self, kind):
+        if kind == "flm":
+            self.refresh_flm_files()
+            return
+        if self.busy or self.job_id is not None:
+            return
+        if self.artifact_picker is not None and self.artifact_picker.exists():
+            self.artifact_picker.window.lift()
+            return
+        self.artifact_picker = ArtifactPicker(self, kind, lambda info: self._artifact_selected(kind, info))
+
+    def refresh_flm_files(self, auto=False):
+        if self.busy or self.job_id is not None or self.client is None:
+            if not auto and self.client is None:
+                self.require_client()
+            return False
+        generation = self.connection_generation
+        if auto and self._flm_list_generation == generation:
+            return False
+        self._flm_list_generation = generation
+        client = self.client
+        self.flm_list_hint.set("正在读取 SD 算法列表…")
+        def work():
+            root = ensure_artifact_directory(client, "flm")
+            return client.list_files(root)
+        def done(entries):
+            self._apply_flm_files(entries)
+            self._maybe_auto_preview()
+        def failed(exc):
+            self.flm_files.clear()
+            self.flm_combo.configure(values=())
+            self.selected_flm = None
+            self.flm_choice.set("")
+            self.flm_filename.set("尚未选择 FLM 算法")
+            self.flm_list_hint.set("加载失败，请检查连接后刷新 FLM")
+            self.report_error(exc, "加载 FLM 列表失败", popup=not auto)
+        self.submit(work, done, label="读取 FLM 列表", error_handler=failed)
+        return True
+
+    def _apply_flm_files(self, entries):
+        self.flm_files = {entry["name"]: entry for entry in sorted(entries, key=lambda item: item["name"].casefold())
+                          if not entry["is_dir"] and entry["name"].lower().endswith(ARTIFACT_EXTENSIONS["flm"])
+                          and entry["path"].rsplit("/", 1)[0] == ARTIFACT_DIRS["flm"]}
+        self.flm_combo.configure(values=tuple(self.flm_files))
+        selected = self.selected_flm
+        match = self.flm_files.get(selected["name"]) if selected else None
+        unchanged = (selected is not None and match is not None and selected["path"] == match["path"]
+                     and selected["version"] == match["version"] and selected["device_id"] == self.client.info["device_id"]
+                     and selected["endpoint"] == self.connected_endpoint)
+        if not unchanged:
+            self.selected_flm = None
+            self.flm_choice.set("")
+            self.flm_filename.set("尚未选择 FLM 算法")
+            if selected:
+                self.log_message("所选 FLM 已变化或不存在，请重新选择算法。", "WARN")
+        else:
+            self.flm_choice.set(selected["name"])
+        ignored = sum(not entry["is_dir"] and not entry["name"].lower().endswith(ARTIFACT_EXTENSIONS["flm"])
+                      for entry in entries)
+        text = "%d 个算法 · 仅 FLM · 请从下拉框选择" % len(self.flm_files) if self.flm_files else \
+               "/FLM 中没有 仅 FLM 算法，请在文件管理中上传"
+        if ignored:
+            text += " · 已过滤 %d 个其他类型文件" % ignored
+        self.flm_list_hint.set(text)
+        self._update_flash_button()
+
+    def select_flm(self, _=None):
+        if self.busy or self.job_id is not None or self.client is None:
+            return
+        entry = self.flm_files.get(self.flm_choice.get())
+        if entry:
+            self._artifact_selected("flm", entry)
+
+    def _artifact_selected(self, kind, info):
+        artifact_path(info["path"], kind)
+        selected = dict(info, device_id=self.client.info["device_id"], endpoint=self.connected_endpoint)
+        if kind == "hex":
+            self.selected_hex = selected
+            self.flash_path_var.set(info["path"])
+            self.hex_filename.set(info["name"])
+        else:
+            self.selected_flm = selected
+            self.flm_filename.set(info["name"])
+            self.flm_choice.set(info["name"])
+        self.log_message("已选用 %s · %s" % (kind.upper(), info["name"]), "SUCCESS")
+        self._update_flash_button()
+        if kind == "hex":
+            self.load_hex_preview()
+
+    def _selected_flash_files(self):
+        if not self.selected_hex or not self.selected_flm:
+            raise ValueError("请分别选择 HEX 固件和 FLM 烧录算法。")
+        for kind, selected in (("hex", self.selected_hex), ("flm", self.selected_flm)):
+            artifact_path(selected["path"], kind)
+            if (selected["device_id"] != self.client.info["device_id"] or
+                    selected["endpoint"] != self.connected_endpoint):
+                raise ValueError("设备连接已变化，请重新选择 HEX 和 FLM。")
+        return dict(self.selected_hex), dict(self.selected_flm)
+
+    def _preview_placeholder(self, text):
+        self.hex_text.configure(state="normal")
+        self.hex_text.delete("1.0", "end")
+        self.hex_text.insert("end", text, "blank")
+        self.hex_text.configure(state="disabled")
+
+    def _preview_path_changed(self, *_):
+        self._preview_request += 1
+        self._preview_limit = 16 * 1024
+        self._preview_attempt = self._preview_loaded_path = None
+        self._preview_truncated = False
+        self.hex_preview_info.set("固件已更换，正在准备预览")
+        self._preview_placeholder("预览内容已清除。\n\n刷新后查看当前来源的固件，避免混淆不同文件。")
+        self._update_preview_actions()
+
+    def _update_preview_actions(self):
+        if not hasattr(self, "preview_refresh_button"):
+            return
+        available = self.client is not None and not self.busy and self.job_id is None
+        self.preview_refresh_button.configure(state="normal" if available else "disabled")
+        self.preview_more_button.configure(state="normal" if available and self._preview_truncated and self._preview_limit < 256 * 1024 else "disabled")
+
+    def _maybe_auto_preview(self):
+        if self.client is not None and self.refresh_flm_files(auto=True):
+            return
+        if (not self.closed and self.client is not None and not self.busy and self.job_id is None
+                and self.notebook.select() == str(self.jobs_page)):
+            self.load_hex_preview(auto=True)
+
+    def load_more_preview(self):
+        if not self._preview_truncated or self.busy:
+            return
+        self._preview_limit = min(256 * 1024, self._preview_limit * 2)
+        self.load_hex_preview()
+
+    def load_hex_preview(self, auto=False):
+        if self.busy or self.job_id is not None:
+            return
+        if self.client is None:
+            if not auto:
+                self.require_client()
+            return
+        path, client, generation = self._firmware_path(), self.client, self.connection_generation
+        if not path:
+            if not auto:
+                self.report_error(ValueError("请先通过弹窗选择 HEX 固件。"), "无法加载 HEX 预览")
+            return
+        key = (generation, path)
+        if auto and self._preview_attempt == key:
+            return
+        self._preview_attempt = key
+        self._preview_request += 1
+        request, limit = self._preview_request, self._preview_limit
+        self.hex_preview_info.set("正在读取 · " + Path(path).name)
+        def current():
+            return (request == self._preview_request and generation == self.connection_generation and
+                    client is self.client and path == self._firmware_path())
+        def work():
+            result = client.read_preview(path, max_bytes=limit)
+            lines = preview_lines(result["data"], result["truncated"], max_lines=MAX_PREVIEW_LINES + 1)
+            result["lines_limited"] = len(lines) > MAX_PREVIEW_LINES
+            return result, lines[:MAX_PREVIEW_LINES]
+        def done(value):
+            if not current():
+                return
+            result, lines = value
+            self.hex_text.configure(state="normal")
+            self.hex_text.delete("1.0", "end")
+            segments = []
+            for line in lines:
+                segments.extend(("%5d  " % line.number, ("number",), line.text + "\n", (line.kind,)))
+            if segments:
+                self.hex_text.insert("end", *segments)
+            else:
+                self.hex_text.insert("end", "文件为空。", "blank")
+            self.hex_text.configure(state="disabled")
+            self.hex_text.yview_moveto(0)
+            self.hex_text.xview_moveto(0)
+            self._preview_loaded_path, self._preview_truncated = path, result["truncated"]
+            total, shown = size_text(result["size"]), size_text(len(result["data"]))
+            if result["truncated"]:
+                tail = "可加载更多" if limit < 256 * 1024 else "已达预览上限，可取回文件查看全文"
+                text = "%s · 已显示 %s / %s · %s" % (Path(path).name, shown, total, tail)
+            else:
+                text = "%s · %s · %d 行 · %s" % (Path(path).name, total, len(lines), "文件完整性一致")
+            if result["lines_limited"]:
+                text += " · 仅显示前 %d 行" % MAX_PREVIEW_LINES
+            bad = sum(line.kind == "error" for line in lines)
+            if bad:
+                text += " · %d 条异常记录" % bad
+                self.log_message("HEX 预览 · %s · %d 条记录存在格式或校验异常" % (Path(path).name, bad), "ERROR")
+            else:
+                self.log_message("已加载 HEX 预览 · %s · %s / %s" % (Path(path).name, shown, total))
+            self.hex_preview_info.set(text)
+            self._update_preview_actions()
+        def failed(exc):
+            if current():
+                self._preview_loaded_path = None
+                self._preview_truncated = False
+                self.hex_preview_info.set("预览加载失败 · 请检查文件路径")
+                self._preview_placeholder("无法读取当前文件。\n\n" + error_notice(exc).text)
+                self.report_error(exc, "HEX 预览失败", popup=not auto)
+                self._update_preview_actions()
+        self.submit(work, done, label="读取 HEX 预览", error_handler=failed)
 
     def button(self, parent, text, command, style="TButton"):
         if style == "TButton" and text in ("删除所选", "取消任务"):
@@ -247,7 +522,7 @@ class App:
         if not self.closed:
             self.report_error(exc, "界面操作未完成")
 
-    def submit(self, work, done=None, label="操作", background=False):
+    def submit(self, work, done=None, label="操作", background=False, error_handler=None):
         if self.busy or self.closed or (background and self.poll_pending):
             return
         if background:
@@ -259,6 +534,7 @@ class App:
             self.activity_bar.start(14)
             for button in self.buttons:
                 button.configure(state="disabled")
+        self._update_flash_button()
         future = self.executor.submit(work)
         generation = self.connection_generation
         def finished(result):
@@ -270,7 +546,7 @@ class App:
                 except Exception:
                     pass
                 return
-            self.messages.put((result, done, label, background, generation))
+            self.messages.put((result, done, label, background, generation, error_handler))
         future.add_done_callback(finished)
 
     def drain(self):
@@ -287,7 +563,7 @@ class App:
                 else:
                     self._benchmark_progress(done)
                 continue
-            label, background, generation = event[2:]
+            label, background, generation, error_handler = event[2:]
             if background:
                 self.poll_pending = False
                 if generation != self.connection_generation:
@@ -311,7 +587,10 @@ class App:
                     self.bench_stop.configure(state="disabled")
                 if background:
                     self.poll_suspended = True
-                self.report_error(exc, label + "失败", popup=not background)
+                if error_handler:
+                    error_handler(exc)
+                else:
+                    self.report_error(exc, label + "失败", popup=not background)
             self._update_flash_button()
         if not self.closed:
             self.root.after(50, self.drain)
@@ -368,15 +647,29 @@ class App:
         self.submit(work, attached, label="读取设备状态")
 
     def disconnect(self):
+        if self.artifact_picker is not None and self.artifact_picker.exists():
+            self.artifact_picker.window.destroy()
         if self.client:
             self.client.close()
         self.client, self.stream_id, self.job_id = None, None, None
         self.connected_endpoint = None
+        self._flm_list_generation = None
+        self.flm_files.clear()
+        self.flm_combo.configure(values=())
+        self.flm_choice.set("")
+        self.selected_flm = None
+        self.flm_filename.set("尚未选择 FLM 算法")
+        self.flm_list_hint.set("连接设备后加载 /FLM 目录中的 仅 FLM")
         self.connection_generation += 1
         self.connection_badge.configure(text="● 未连接", foreground="#64748B")
         self.device_summary.set("设备未连接")
         self.log_message("连接已断开。设备上的任务与 SD 日志可能继续，重连后可查询。", "WARN")
         self.status.set("已断开；设备侧任务和 SD 日志可能继续，重连后自动恢复任务状态")
+        self._preview_request += 1
+        self._preview_attempt = self._preview_loaded_path = None
+        self._preview_truncated = False
+        self.hex_preview_info.set("连接已断开 · 重连后重新加载")
+        self._preview_placeholder("连接已断开。\n\n重新连接后加载当前设备的 HEX 文件。")
         self._update_flash_button()
 
     def refresh(self):
@@ -392,8 +685,12 @@ class App:
             self.files.insert("", "end", iid=entry["path"], values=(entry["path"],
                               "文件夹" if entry["is_dir"] else size_text(entry["size"]),
                               entry["version"][:12] + "…" if entry["version"] else "—"))
-        self.file_summary.set("目录 %s · %d 项；双击文件夹进入。" % (self.directory.get(), len(entries)))
+        self.file_summary.set("目录 %s · %d 项；双击文件夹进入，文件使用上方按钮操作。" % (self.directory.get(), len(entries)))
         self.log_message("已读取目录 %s · %d 项" % (self.directory.get(), len(entries)))
+        if self.directory.get().rstrip("/") == ARTIFACT_DIRS["flm"]:
+            self._flm_list_generation = self.connection_generation
+            self._apply_flm_files(entries)
+        self._maybe_auto_preview()
 
     def parent_directory(self):
         parts = self.directory.get().strip("/").split("/")
@@ -413,27 +710,45 @@ class App:
         selection = self.files.selection()
         return self.entries.get(selection[0]) if selection else None
 
-    def open_directory(self, _):
-        entry = self.selected()
+    def open_directory(self, event):
+        if self.busy or self.client is None:
+            return "break"
+        row = self.files.identify_row(event.y)
+        entry = self.entries.get(row)
         if entry and entry["is_dir"]:
+            self.files.selection_set(row)
             self.directory.set(entry["path"])
             self.refresh()
+        return "break"
 
     def upload(self):
-        if not self.require_client():
+        if self.busy or not self.require_client():
             return
-        local = filedialog.askopenfilename()
+        local = filedialog.askopenfilename(parent=self.root, title="选择要上传的文件")
         if not local:
             return
-        remote = simpledialog.askstring("上传路径", "设备上的完整路径：", initialvalue=self.directory.get().rstrip("/") + "/" + Path(local).name)
-        if remote:
-            overwrite = messagebox.askyesno("覆盖策略", "允许替换设备上同名文件？")
-            client, progress = self.client, self._transfer_callback("上传文件")
-            def done(result):
-                self.log_message("上传完成 · %s → %s · %s · 文件校验通过" % (Path(local).name, remote, size_text(result["size"])), "SUCCESS")
+        directory = self.directory.get().rstrip("/") or "/"
+        remote = directory.rstrip("/") + "/" + Path(local).name
+        client = self.client
+        progress = self._transfer_callback("上传文件")
+        def start(overwrite_version=None):
+            def work():
+                return upload_regular_file(client, local, remote, progress, overwrite_version)
+            def done(info):
+                self.log_message("上传完成 · %s · %s · 文件校验通过" % (Path(local).name, size_text(info["size"])), "SUCCESS")
+                self.directory.set(directory)
                 self.refresh()
-            self.submit(lambda: client.upload(local, remote, overwrite,
-                                               resume_file=local + ".dap-upload.json", progress=progress), done, label="上传文件")
+            def failed(exc):
+                if isinstance(exc, UploadConflict):
+                    if messagebox.askyesno("文件重名", "目标目录已存在“%s”，是否覆盖？" % Path(exc.path).name,
+                                           parent=self.root, default="no"):
+                        start(exc.version)
+                    else:
+                        self.log_message("已取消上传，保留设备上的同名文件。")
+                else:
+                    self.report_error(exc, "上传文件失败")
+            self.submit(work, done, label="上传文件", error_handler=failed)
+        start()
 
     def file_done(self, result):
         self.show(result)
@@ -505,28 +820,53 @@ class App:
             client = self.client
             self.submit(lambda: client.call(Op.RTT_WRITE, stream_id=stream, data=data), label="发送 RTT 文本")
 
+    def _firmware_cache(self):
+        return (self.flash_operations.path.parent if self.flash_operations.path else
+                Path(__file__).resolve().parents[1] / ".dapremote") / "firmware-cache"
+
     def check_hex(self):
-        if self.require_client():
-            path = self.flash_path.get()
-            client = self.client
-            def done(value):
-                self.show(value, self.job_text)
-                self.show(value)
-            self.submit(lambda: client.check_hex(path), done, label="检查 HEX 固件")
+        if self.busy or self.job_id is not None or not self.require_client():
+            return
+        try:
+            firmware, algorithm = self._selected_flash_files()
+        except ValueError as exc:
+            self.report_error(exc, "尚未选择完整")
+            return
+        client = self.client
+        def done(value):
+            self.show(value, self.job_text)
+            self.show(value)
+        self.submit(lambda: client.check_hex(firmware["path"], version=firmware["version"],
+                                            flm_path=algorithm["path"], flm_version=algorithm["version"]),
+                    done, label="检查 HEX 与 FLM")
 
     def flash(self):
-        if self.busy or not self.require_client():
+        if self.busy or self.job_id is not None or not self.require_client():
             return
-        path, client, endpoint = self.flash_path.get(), self.client, self.connected_endpoint
+        client, endpoint = self.client, self.connected_endpoint
+        # Recovery remains available even when the chooser has no current selection.
+        def work():
+            previous = self.flash_operations.current(client, endpoint)
+            if previous and previous["state"] not in {"DONE", "FAILED", "CANCELLED", "INTERRUPTED", "REJECTED"}:
+                return dict(job=self.flash_operations.query(client, endpoint), recovered=True)
+            if selection_error is not None:
+                raise selection_error
+            return self.flash_operations.start(client, endpoint, firmware["path"],
+                                                expected_version=firmware["version"],
+                                                flm_path=algorithm["path"], flm_version=algorithm["version"])
+        try:
+            firmware, algorithm = self._selected_flash_files()
+            selection_error = None
+        except ValueError as exc:
+            firmware = algorithm = None
+            selection_error = exc
         def done(outcome):
-            if outcome["recovered"]:
-                self.log_message("已确认上次烧录任务的状态，没有重复启动。")
-            else:
-                self.log_message("已提交烧录 · " + path)
+            self.log_message("已确认上次烧录任务的状态，没有重复启动。" if outcome["recovered"] else
+                             "已提交烧录 · %s · 算法 %s" % (firmware["name"], algorithm["name"]))
             self.job_updated(outcome["job"])
             if self.flash_operations.last_save_error:
                 self.log_message("本地任务状态更新失败，重连后将重新查询设备。", "WARN")
-        self.submit(lambda: self.flash_operations.start(client, endpoint, path), done, label="开始烧录")
+        self.submit(work, done, label="开始烧录")
 
     def refresh_flash(self):
         if self.busy or not self.require_client():
@@ -542,7 +882,12 @@ class App:
 
     def _update_flash_button(self):
         if hasattr(self, "flash_button"):
-            self.flash_button.configure(state="disabled" if self.busy or self.client is None or self.job_id is not None else "normal")
+            ready = self.selected_hex is not None and self.selected_flm is not None
+            self.flash_button.configure(state="normal" if ready and not self.busy and self.client is not None and self.job_id is None else "disabled")
+        if hasattr(self, "flm_combo"):
+            self.flm_combo.configure(state="readonly" if self.client is not None and not self.busy
+                                     and self.job_id is None and self.flm_files else "disabled")
+        self._update_preview_actions()
 
     def job_updated(self, result):
         if self.client is not None:

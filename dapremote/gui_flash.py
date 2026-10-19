@@ -96,7 +96,16 @@ class FlashCoordinator:
         self.observe(client, endpoint, job)
         return job
 
-    def start(self, client, endpoint, path):
+    def start_local(self, client, endpoint, local_path, cache_dir, progress=None):
+        """Recover unresolved jobs first; otherwise upload/check a PC snapshot and burn."""
+        previous = self.current(client, endpoint)
+        if previous and previous["state"] not in TERMINAL:
+            return dict(job=self.query(client, endpoint), recovered=True)
+        from .firmware import prepare_local_firmware
+        firmware = prepare_local_firmware(client, local_path, cache_dir, progress)
+        return self.start(client, endpoint, firmware["path"], expected_version=firmware["version"])
+
+    def start(self, client, endpoint, path, expected_version=None, flm_path=None, flm_version=None):
         """New intent => fresh ID; unresolved intent => query only, never blind replay."""
         path = path.strip()
         if not path:
@@ -106,10 +115,17 @@ class FlashCoordinator:
             return dict(job=self.query(client, endpoint), recovered=True)
         # Read-only preflight; a failure here has never submitted a flash request.
         version = client.stat(path)["version"]
+        if expected_version is not None and version != expected_version:
+            raise ValueError("SD 固件在校验后发生变化，已停止烧录，请重新选择文件。")
+        if flm_path:
+            flm_version = flm_version or client.stat(flm_path)["version"]
+            client.check_hex(path, version=version, flm_path=flm_path, flm_version=flm_version)
         target_id = client.call(Op.TARGET_INFO)["target_id"]
         key = self._key(client, endpoint)
         record = dict(endpoint=key[0], device_id=key[1], operation_token=uuid.uuid4().hex,
                       path=path, version=version, target_id=target_id, state="REQUESTING", job_id="")
+        if flm_path:
+            record.update(flm_path=flm_path, flm_version=flm_version)
         with self.lock:
             if key not in self.records and len(self.records) >= 128:
                 raise PendingFlashError("本地设备恢复记录已达上限，请先备份整理记录。")
@@ -123,8 +139,9 @@ class FlashCoordinator:
                     self.records.pop(key, None)
                 raise
         try:
+            extra = dict(flm_path=flm_path, flm_version=flm_version) if flm_path else {}
             job = client.start_flash(path, record["operation_token"], version=version,
-                                     target_id=target_id, run_after=False)
+                                     target_id=target_id, run_after=False, **extra)
         except Exception as exc:
             with self.lock:
                 record["state"] = "REJECTED" if isinstance(exc, RemoteError) and exc.status in REJECTED else "UNKNOWN"
