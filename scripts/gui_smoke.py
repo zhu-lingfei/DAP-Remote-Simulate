@@ -1,0 +1,139 @@
+"""Hidden-window integration check. Run manually in a desktop session, not in CI.
+
+Builds the real widgets, connects to a temporary simulator and invokes benchmark
+and scan workflows. No dialogs, no existing devices, no visible application window.
+"""
+import sys
+import tempfile
+import time
+import tkinter as tk
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from dapremote.gui import App
+from dapremote.gui_flash import FlashCoordinator
+from dapremote.client import RemoteError
+from dapremote.protocol import Status
+from dapremote.simulator import FaultPlan, SimulatorServer
+from dapremote.protocol import Op
+from unittest.mock import patch
+
+
+def main():
+    with tempfile.TemporaryDirectory() as directory, SimulatorServer(directory, port=0) as server:
+        root = tk.Tk()
+        root.withdraw()
+        state_path = Path(directory) / "gui-state" / "flash.json"
+        app = App(root, "tcp://127.0.0.1:%d" % server.server_address[1], 115200, state_path=state_path)
+        app.error_dialogs.set(False)
+        def wait_until(predicate, timeout=8):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                root.update()
+                if predicate():
+                    return
+                time.sleep(0.01)
+            raise AssertionError("GUI operation did not finish: " + app.status.get())
+        try:
+            app.connect()
+            wait_until(lambda: app.client is not None and not app.busy)
+            app.bench_size.set("8")
+            app.start_benchmark(False)
+            wait_until(lambda: not app.busy)
+            assert "一致" in app.bench_summary.get(), app.bench_summary.get()
+            app.bench_rates.set("115200,230400")
+            app.bench_rounds.set("1")
+            app.start_benchmark(True)
+            wait_until(lambda: not app.busy)
+            assert "TCP 模拟" in app.bench_summary.get(), app.bench_summary.get()
+            assert len(app.bench_table.get_children()) == 2
+            assert str(app.bench_stop.cget("state")) == "disabled"
+            text = app.log.get("1.0", "end-1c")
+            assert "TCP 模拟" in text and "SUCCESS" in text, text
+            assert '"received_bytes"' not in text and "{'" not in text, text
+            assert str(app.log.cget("state")) == "disabled"
+
+            # User action errors: readable message, red tag, optional one-time dialog.
+            app.report_error(RemoteError(Status.NO_SPACE, dict(message="insufficient space")), "上传失败")
+            assert app.log.tag_ranges("ERROR"), "missing ERROR highlighting"
+            assert app.log.tag_cget("ERROR", "foreground") == "#B91C1C"
+            assert "可用空间不足" in app.log.get("1.0", "end-1c")
+            with patch("dapremote.gui.messagebox.showerror") as dialog:
+                app.error_dialogs.set(True)
+                app.report_error(ValueError("请检查文件路径"), "操作失败")
+                assert dialog.call_count == 1
+                app.error_dialogs.set(False)
+
+            # Background errors are logged once, suspend polling, and never open dialogs.
+            def failing_poll():
+                raise RemoteError(Status.IO_ERROR, dict(message="injected failure"))
+            with patch("dapremote.gui.messagebox.showerror") as dialog:
+                app.submit(failing_poll, label="刷新设备数据", background=True)
+                wait_until(lambda: not app.poll_pending)
+                assert dialog.call_count == 0
+                assert app.poll_suspended
+            app.poll_suspended = False
+
+            # Repeated polling of the same job phase must not flood either log.
+            job = dict(job_id="display-only", state="RUNNING", phase="PROGRAMMING",
+                       completed_bytes=10, total_bytes=100, error="")
+            app.job_updated(job)
+            count = app.log_count
+            app.job_updated(dict(job, completed_bytes=20))
+            assert app.log_count == count
+            assert float(app.job_bar["value"]) == 20
+            app.job_id = None  # This display-only record is not a real device task.
+
+            # Actual RTT output is inserted as text, not repr(bytes) or JSON.
+            app.destination.set("电脑")
+            app.start_rtt()
+            wait_until(lambda: app.stream_id is not None and not app.busy)
+            wait_until(lambda: "SIM RTT" in app.rtt_text.get("1.0", "end-1c"))
+            displayed = app.rtt_text.get("1.0", "end-1c")
+            assert "b'" not in displayed and "\\x00" in displayed, displayed
+            app.stop_rtt()
+            wait_until(lambda: app.stream_id is None and not app.busy)
+
+            # Each explicit click after completion creates a new flash job without IDs in UI.
+            assert not hasattr(app, "token"), "internal ID must not have an entry widget"
+            app.client.upload(Path(__file__).resolve().parents[1] / "examples" / "blink.hex", "/blink.hex")
+            def flash_finished():
+                record = app.flash_operations.current(app.client, app.connected_endpoint) if app.client else None
+                return not app.busy and record is not None and record["state"] == "DONE" and app.job_id is None
+            tokens = []
+            for expected_jobs in (1, 2):
+                app.flash()
+                wait_until(flash_finished)
+                assert len(server.device.jobs) == expected_jobs
+                tokens.append(app.flash_operations.current(app.client, app.connected_endpoint)["operation_token"])
+                assert str(app.flash_button.cget("state")) == "normal"
+            assert tokens[0] != tokens[1]
+            app.refresh_flash()
+            wait_until(lambda: not app.busy)
+            assert len(server.device.jobs) == 2
+
+            # Execute-then-disconnect: reload hidden state and reconnect, query not reflash.
+            server.faults = FaultPlan([("disconnect", Op.FLASH_START, 1)])
+            app.flash()
+            wait_until(lambda: not app.busy)
+            pending = app.flash_operations.current(app.client, app.connected_endpoint)
+            assert pending["state"] == "UNKNOWN"
+            tokens.append(pending["operation_token"])
+            app.disconnect()
+            app.flash_operations = FlashCoordinator(state_path)
+            app.connect()
+            wait_until(flash_finished)
+            assert len(server.device.jobs) == 3
+            assert app.flash_operations.current(app.client, app.connected_endpoint)["operation_token"] == tokens[-1]
+            visible_log = app.log.get("1.0", "end-1c") + app.job_text.get("1.0", "end-1c")
+            assert all(token not in visible_log for token in tokens), "internal ID leaked to visible logs"
+            app.clear_log()
+            assert not app.log.get("1.0", "end-1c")
+            assert app.log_count == 0
+            print("GUI smoke passed: readable UI, one-click flashing, hidden IDs, reconnect recovery, benchmark, RTT, error handling")
+        finally:
+            app.close()
+
+
+if __name__ == "__main__":
+    main()

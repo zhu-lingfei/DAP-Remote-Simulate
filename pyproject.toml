@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dapremote"
+version = "0.2.0"
+description = "Reliable framed DAP remote protocol, client and fault-injecting simulator"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+serial = ["pyserial>=3.5,<4"]
+
+[project.scripts]
+dapremote = "dapremote.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dapremote*"]
